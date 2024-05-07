@@ -1,7 +1,10 @@
-use wgpu::Features;
+use std::sync::Arc;
+
+use pollster::FutureExt;
+use wgpu::{Features, RenderPassDescriptor};
 use winit::{
     application::ApplicationHandler,
-    dpi::{LogicalSize, Size},
+    dpi::{LogicalSize, PhysicalSize, Size},
     event::{ElementState, KeyEvent, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
@@ -9,7 +12,8 @@ use winit::{
 };
 
 struct App {
-    window: Option<Window>,
+    window: Option<Arc<Window>>,
+    state: Option<State<'static>>,
     size: Size,
 }
 
@@ -17,7 +21,7 @@ impl Default for App {
     fn default() -> Self {
         App {
             window: None,
-
+            state: None,
             size: LogicalSize::new(1280, 720).into(),
         }
     }
@@ -25,7 +29,7 @@ impl Default for App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        self.window = Some(
+        let window = Arc::new(
             event_loop
                 .create_window(
                     Window::default_attributes()
@@ -36,6 +40,13 @@ impl ApplicationHandler for App {
                 )
                 .expect("An error occured while creating the window"),
         );
+
+        self.window = Some(window.clone());
+        self.state = Some(State::new(window).block_on());
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
+        self.window.as_ref().unwrap().request_redraw();
     }
 
     fn window_event(
@@ -45,6 +56,10 @@ impl ApplicationHandler for App {
         event: winit::event::WindowEvent,
     ) {
         if window_id != self.window.as_ref().unwrap().id() {
+            return;
+        }
+
+        if self.state.as_mut().unwrap().input(event.clone()) {
             return;
         }
 
@@ -59,6 +74,18 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => event_loop.exit(),
+            WindowEvent::Resized(inner_size) => self.state.as_mut().unwrap().resize(inner_size),
+            WindowEvent::RedrawRequested => {
+                let state = self.state.as_mut().unwrap();
+
+                state.update();
+                match state.render() {
+                    Ok(_) => println!("RENDER"),
+                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size.to_physical(1.0)),
+                    Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+                    Err(e) => eprintln!("{:?}", e),
+                }
+            }
             _ => {}
         }
     }
@@ -70,11 +97,10 @@ struct State<'a> {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: Size,
-    window: &'a Window,
 }
 
 impl<'a> State<'a> {
-    async fn new(window: &'a Window) -> State<'a> {
+    async fn new(window: Arc<Window>) -> State<'a> {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -82,7 +108,7 @@ impl<'a> State<'a> {
             ..Default::default()
         });
 
-        let surface = instance.create_surface(window).expect(
+        let surface = instance.create_surface(window.clone()).expect(
             format!(
                 "An error occured while creating a surface with the instance {:?}",
                 instance
@@ -149,24 +175,63 @@ impl<'a> State<'a> {
             device,
             queue,
             surface,
-            window,
         }
     }
 
-    fn resize(&mut self, size: Size) {
-        todo!()
+    fn resize(&mut self, size: PhysicalSize<u32>) {
+        if size.width <= 0 || size.height <= 0 {
+            return;
+        }
+
+        self.size = size.into();
+        self.config.width = size.width;
+        self.config.height = size.height;
+        self.surface.configure(&self.device, &self.config);
     }
 
-    fn input(&mut self, event: WindowEvent) {
-        todo!()
+    fn input(&mut self, _event: WindowEvent) -> bool {
+        false
     }
 
-    fn update(&mut self) {
-        todo!()
-    }
+    fn update(&mut self) {}
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        todo!()
+        let output = self.surface.get_current_texture()?;
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("WGPU Render Command Encoder"),
+            });
+
+        {
+            encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("WGPU Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.2,
+                            g: 0.2,
+                            b: 0.2,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+        Ok(())
     }
 }
 
